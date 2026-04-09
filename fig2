@@ -1,0 +1,198 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. 数据生成函数 (坚固版，恢复原版数据长度)
+# ==========================================
+def generate_logistic_robust(beta_xy, beta_yx, L_total=6000, discard=1000):
+    gamma_x = 3.8
+    gamma_y = 3.6
+    
+    x = np.zeros(L_total)
+    y = np.zeros(L_total)
+    
+    # 初始化
+    x[0] = np.random.uniform(0.1, 0.9)
+    y[0] = np.random.uniform(0.1, 0.9)
+    
+    noise_x = np.random.normal(0, 0.015, L_total)
+    noise_y = np.random.normal(0, 0.015, L_total)
+    
+    for t in range(L_total - 1):
+        next_x = x[t] * (gamma_x - (gamma_x - beta_yx)*x[t] - beta_yx*y[t]) + noise_x[t]
+        next_y = y[t] * (gamma_y - (gamma_y - beta_xy)*y[t] - beta_xy*x[t]) + noise_y[t]
+        
+        # 防止混沌系统被噪声震飞的工程截断
+        x[t+1] = np.clip(next_x, 0.0001, 0.9999)
+        y[t+1] = np.clip(next_y, 0.0001, 0.9999)
+        
+    return x[discard:], y[discard:]
+
+# ==========================================
+# 2. 核心 RCM 计算函数
+# ==========================================
+def mapstd(data):
+    mean_val = np.mean(data, axis=1, keepdims=True)
+    std_val = np.std(data, axis=1, ddof=1, keepdims=True)
+    std_val[std_val == 0] = 1.0
+    return (data - mean_val) / std_val
+
+def RCM_index(target_data, input_data, dim=1, scale=6.0):
+    length = len(target_data)
+    data = np.vstack((target_data, input_data))
+    Data = mapstd(data)
+
+    # --- 第一层储池 (Embedding) ---
+    resSize1 = 200
+    gamma1 = 1.0 
+    
+    Win1 = np.random.uniform(-1, 1, (resSize1, dim))
+    Wres1 = np.random.uniform(-1, 1, (resSize1, resSize1))
+    rho1 = np.max(np.abs(np.linalg.eigvals(Wres1)))
+    Wres1 = Wres1 * (0.67 / rho1) 
+    
+    r1 = np.zeros((resSize1, 1))
+    r2 = np.zeros((resSize1, 1))
+    rtotal1 = np.zeros((resSize1, length))
+    rtotal2 = np.zeros((resSize1, length))
+
+    for i in range(length):
+        ut1 = Data[0:dim, i].reshape(-1, 1)
+        r1 = (1 - gamma1) * r1 + gamma1 * np.tanh(Win1 @ ut1 + Wres1 @ r1)
+        rtotal1[:, i:(i+1)] = r1
+        
+        ut2 = Data[dim:2*dim, i].reshape(-1, 1)
+        r2 = (1 - gamma1) * r2 + gamma1 * np.tanh(Win1 @ ut2 + Wres1 @ r2)
+        rtotal2[:, i:(i+1)] = r2
+
+    rtotal1[1::2, :] = rtotal1[1::2, :] ** 2
+    rtotal2[1::2, :] = rtotal2[1::2, :] ** 2
+
+    Data1 = mapstd(rtotal1)
+    Data2 = mapstd(rtotal2)
+
+    # --- 第二层储池 (Estimation) ---
+    resSize2 = 1000
+    gamma2 = 1.0 
+    
+    Win2 = np.random.uniform(-1, 1, (resSize2, resSize1))
+    Wres2 = np.random.uniform(-1, 1, (resSize2, resSize2))
+    rho2 = np.max(np.abs(np.linalg.eigvals(Wres2)))
+    Wres2 = Wres2 * (0.9 / rho2) 
+    
+    r_est = np.zeros((resSize2, 1))
+    rtotal_est = np.zeros((resSize2, length))
+
+    for i in range(length):
+        ut = Data2[:, i].reshape(-1, 1)
+        r_est = (1 - gamma2) * r_est + gamma2 * np.tanh(Win2 @ ut + Wres2 @ r_est)
+        rtotal_est[:, i:(i+1)] = r_est
+
+    rtotal_est[1::2, :] = rtotal_est[1::2, :] ** 2
+
+    # 截断瞬态 (论文设定 1000)
+    initialen = 1000 
+    rtrain = rtotal_est[:, initialen:]
+    traindata = Data1[:, initialen:]
+
+    beta = 1e-5 
+    A = rtrain @ rtrain.T + beta * np.eye(resSize2)
+    B = rtrain @ traindata.T
+    Wout = np.linalg.solve(A, B).T
+    
+    trainoutput = Wout @ rtrain
+    
+    Mse1 = np.mean((trainoutput - traindata) ** 2)
+    dataset_mean = np.mean(traindata)
+    dataset_variance = np.mean((traindata - dataset_mean) ** 2)
+    
+    NMSE = Mse1 / dataset_variance
+    INDEX = np.exp(-scale * NMSE) 
+    return INDEX
+
+# ==========================================
+# 3. 运行实验
+# ==========================================
+# 为了快速跑通看图表，n_trials 设置为 2
+betas_xy = np.arange(0, 1.1, 0.1)
+n_trials = 20  
+L_total = 6000
+
+results = {
+    'unidir': {'RCM_X_Y': [], 'RCM_Y_X': []},
+    'bidir': {'RCM_X_Y': [], 'RCM_Y_X': []}
+}
+
+print("开始计算 ...")
+for b_xy in betas_xy:
+    print(f"当前 Beta_xy = {b_xy:.1f}")
+    
+    temp_uni_X_Y, temp_uni_Y_X = [], []
+    temp_bi_X_Y, temp_bi_Y_X = [], []
+    
+    for trial in range(n_trials):
+        # 场景 A: 单向耦合
+        X_uni, Y_uni = generate_logistic_robust(beta_xy=b_xy, beta_yx=0.0, L_total=L_total)
+        temp_uni_X_Y.append(RCM_index(target_data=X_uni, input_data=Y_uni))
+        temp_uni_Y_X.append(RCM_index(target_data=Y_uni, input_data=X_uni))
+        
+        # 场景 B: 双向耦合
+        X_bi, Y_bi = generate_logistic_robust(beta_xy=b_xy, beta_yx=0.1, L_total=L_total)
+        temp_bi_X_Y.append(RCM_index(target_data=X_bi, input_data=Y_bi))
+        temp_bi_Y_X.append(RCM_index(target_data=Y_bi, input_data=X_bi))
+        
+    results['unidir']['RCM_X_Y'].append(temp_uni_X_Y)
+    results['unidir']['RCM_Y_X'].append(temp_uni_Y_X)
+    results['bidir']['RCM_X_Y'].append(temp_bi_X_Y)
+    results['bidir']['RCM_Y_X'].append(temp_bi_Y_X)
+
+print("计算完成，绘图中...")
+
+res_uni_XY = np.array(results['unidir']['RCM_X_Y'])
+res_uni_YX = np.array(results['unidir']['RCM_Y_X'])
+res_bi_XY = np.array(results['bidir']['RCM_X_Y'])
+res_bi_YX = np.array(results['bidir']['RCM_Y_X'])
+
+# ==========================================
+# 4. 可视化绘图
+# ==========================================
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# Plot A: Unidirectional
+ax = axes[0]
+ax.plot(betas_xy, np.mean(res_uni_XY, axis=1), 'b-', label='RCM[X→Y]', linewidth=2)
+ax.fill_between(betas_xy, 
+                np.mean(res_uni_XY, axis=1) - np.std(res_uni_XY, axis=1), 
+                np.mean(res_uni_XY, axis=1) + np.std(res_uni_XY, axis=1), color='b', alpha=0.2)
+
+ax.plot(betas_xy, np.mean(res_uni_YX, axis=1), 'b--', label='RCM[Y→X]', linewidth=2)
+ax.fill_between(betas_xy, 
+                np.mean(res_uni_YX, axis=1) - np.std(res_uni_YX, axis=1), 
+                np.mean(res_uni_YX, axis=1) + np.std(res_uni_YX, axis=1), color='b', alpha=0.2)
+
+ax.axhline(0.05, color='gray', linestyle='--')
+ax.set_title(r'Unidirectional ($\beta_{yx} = 0$)')
+ax.set_xlabel(r'$\beta_{xy}$')
+ax.set_ylim([0, 1])
+ax.legend()
+
+# Plot B: Bidirectional
+ax = axes[1]
+ax.plot(betas_xy, np.mean(res_bi_XY, axis=1), 'b-', label='RCM[X→Y]', linewidth=2)
+ax.fill_between(betas_xy, 
+                np.mean(res_bi_XY, axis=1) - np.std(res_bi_XY, axis=1), 
+                np.mean(res_bi_XY, axis=1) + np.std(res_bi_XY, axis=1), color='b', alpha=0.2)
+
+ax.plot(betas_xy, np.mean(res_bi_YX, axis=1), 'b--', label='RCM[Y→X]', linewidth=2)
+ax.fill_between(betas_xy, 
+                np.mean(res_bi_YX, axis=1) - np.std(res_bi_YX, axis=1), 
+                np.mean(res_bi_YX, axis=1) + np.std(res_bi_YX, axis=1), color='b', alpha=0.2)
+
+ax.axhline(0.05, color='gray', linestyle='--')
+ax.set_title(r'Bidirectional ($\beta_{yx} = 0.1$)')
+ax.set_xlabel(r'$\beta_{xy}$')
+ax.set_ylim([0, 1])
+ax.legend()
+
+plt.tight_layout()
+plt.show()
