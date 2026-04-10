@@ -1,0 +1,78 @@
+import numpy as np
+import matplotlib.pyplot as plt
+def mapstd(data):
+    mean_val = np.mean(data, axis=1, keepdims=True)
+    std_val = np.std(data, axis=1, ddof=1, keepdims=True)
+    std_val[std_val == 0] = 1.0
+    return (data - mean_val) / std_val
+
+# 【关键修正 1】: scale 恢复为 5.0
+def RCM_index(target_data, input_data, dim=1, scale=5.0): 
+    length = len(target_data)
+    data = np.vstack((target_data, input_data))
+    Data = mapstd(data)
+
+    resSize1 = 200
+    # 【关键原则】: 离散系统坚决不能有漏率
+    gamma1 = 1.0 
+    
+    Win1 = np.random.uniform(-1, 1, (resSize1, dim))
+    Wres1 = np.random.uniform(-1, 1, (resSize1, resSize1))
+    rho1 = np.max(np.abs(np.linalg.eigvals(Wres1)))
+    Wres1 = Wres1 * (0.67 / rho1) 
+    
+    r1, r2 = np.zeros((resSize1, 1)), np.zeros((resSize1, 1))
+    rtotal1, rtotal2 = np.zeros((resSize1, length)), np.zeros((resSize1, length))
+
+    for i in range(length):
+        ut1 = Data[0:dim, i].reshape(-1, 1)
+        r1 = (1 - gamma1) * r1 + gamma1 * np.tanh(Win1 @ ut1 + Wres1 @ r1)
+        rtotal1[:, i:(i+1)] = r1
+        
+        ut2 = Data[dim:2*dim, i].reshape(-1, 1)
+        r2 = (1 - gamma1) * r2 + gamma1 * np.tanh(Win1 @ ut2 + Wres1 @ r2)
+        rtotal2[:, i:(i+1)] = r2
+
+    rtotal1[1::2, :] = rtotal1[1::2, :] ** 2
+    rtotal2[1::2, :] = rtotal2[1::2, :] ** 2
+
+    Data1, Data2 = mapstd(rtotal1), mapstd(rtotal2)
+
+    resSize2 = 1000
+    # 【关键原则】: 离散系统坚决不能有漏率
+    gamma2 = 1.0 
+    
+    Win2 = np.random.uniform(-1, 1, (resSize2, resSize1))
+    Wres2 = np.random.uniform(-1, 1, (resSize2, resSize2))
+    rho2 = np.max(np.abs(np.linalg.eigvals(Wres2)))
+    Wres2 = Wres2 * (0.9 / rho2) 
+    
+    r_est = np.zeros((resSize2, 1))
+    rtotal_est = np.zeros((resSize2, length))
+
+    for i in range(length):
+        ut = Data2[:, i].reshape(-1, 1)
+        r_est = (1 - gamma2) * r_est + gamma2 * np.tanh(Win2 @ ut + Wres2 @ r_est)
+        rtotal_est[:, i:(i+1)] = r_est
+
+    rtotal_est[1::2, :] = rtotal_est[1::2, :] ** 2
+
+    initialen = 1000 
+    rtrain = rtotal_est[:, initialen:]
+    traindata = Data1[:, initialen:]
+
+    # 【关键修正 2】: 原文 Fig 3 指定要求 1e-8，给予网络更强的拟合自由度
+    beta = 1e-8 
+    A = rtrain @ rtrain.T + beta * np.eye(resSize2)
+    B = rtrain @ traindata.T
+    Wout = np.linalg.solve(A, B).T
+    
+    trainoutput = Wout @ rtrain
+    
+    Mse1 = np.mean((trainoutput - traindata) ** 2)
+    dataset_mean = np.mean(traindata)
+    dataset_variance = np.mean((traindata - dataset_mean) ** 2)
+    
+    NMSE = Mse1 / dataset_variance
+    INDEX = np.exp(-scale * NMSE) 
+    return INDEX
