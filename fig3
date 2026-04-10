@@ -2,52 +2,51 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ==========================================
-# 1. 数据生成函数 (Equation 2: 三维逻辑斯蒂网络)
+# 1. 数据生成函数 (严格遵循 Equation 2，纯净重抽样)
 # ==========================================
-def generate_eq2(motif, mu, L_total=5000):
-    """
-    生成文中 Equation 2 的三维离散逻辑斯蒂网络数据 [cite: 185, 186]。
-    使用边界反射机制维持混沌特性。
-    """
-    # 自身的增长率参数 [cite: 187]
+def generate_eq2(motif, mu, L_total=6000, discard=1000):
     gamma = np.array([3.6, 3.72, 3.68])
     
-    Y = np.zeros((3, L_total))
-    Y[:, 0] = np.random.uniform(0.1, 0.9, 3)
-    
-    # 耦合矩阵 C, C[i, j] 表示从 i 指向 j 的因果作用 (\gamma_{ij})
+    # 耦合矩阵 C, C[i, j] 表示从 i 指向 j
     C = np.zeros((3, 3))
-    if motif == 'cascade':      # 级联: Y1 -> Y3 -> Y2 [cite: 189]
+    if motif == 'cascade':      
         C[0, 2] = mu  
         C[2, 1] = mu  
-    elif motif == 'fan-out':    # 扇出: Y1 -> Y2, Y1 -> Y3 [cite: 189]
+    elif motif == 'fan-out':    
         C[0, 1] = mu  
         C[0, 2] = mu  
-    elif motif == 'fan-in':     # 扇入: Y1 -> Y2, Y3 -> Y2 [cite: 189]
+    elif motif == 'fan-in':     
         C[0, 1] = mu  
         C[2, 1] = mu  
 
-    for t in range(L_total - 1):
-        # 0.005 标准差的高斯白噪声 [cite: 187]
-        noise = np.random.normal(0, 0.005, 3)
-        for j in range(3):
-            # 计算流入 j 的其他节点的耦合总和
-            sum_coupling = sum(C[i, j] * Y[i, t] for i in range(3) if i != j)
-            # 为了保证系统在 [0,1] 域内稳定，提取出有效的自耦合调整项
-            sum_c_ij = sum(C[i, j] for i in range(3) if i != j)
+    # 临时忽略溢出警告，使用纯净发散重试机制
+    with np.errstate(over='ignore', invalid='ignore'):
+        while True:
+            Y = np.zeros((3, L_total))
+            Y[:, 0] = np.random.uniform(0.1, 0.9, 3)
+            # 依据原文，噪声标准差为 0.005
+            noise = np.random.normal(0, 0.005, (3, L_total))
             
-            # Equation 2 的物理守恒形式 [cite: 186]
-            next_y = Y[j, t] * (gamma[j] - (gamma[j] - sum_c_ij)*Y[j, t] - sum_coupling) + noise[j]
+            diverged = False
+            for t in range(L_total - 1):
+                for j in range(3):
+                    sum_coupling = sum(C[i, j] * Y[i, t] for i in range(3) if i != j)
+                    # 【核心修正】：严格对齐 Eq 2 的非守恒展开式
+                    next_y = Y[j, t] * (gamma[j] - gamma[j]*Y[j, t] - sum_coupling) + noise[j, t]
+                    
+                    if not (0 < next_y < 1) or np.isnan(next_y):
+                        diverged = True
+                        break
+                    Y[j, t+1] = next_y
+                if diverged:
+                    break
             
-            # 物理边界反射机制
-            ny = abs(next_y)
-            Y[j, t+1] = ny if ny <= 1.0 else 2.0 - ny
-            Y[j, t+1] = max(0.0001, min(0.9999, Y[j, t+1]))
-            
-    return Y
+            # 如果跑完没发散，丢弃前1000个瞬态，返回正好5000长度的纯净数据
+            if not diverged:
+                return Y[:, discard:]
 
 # ==========================================
-# 2. 核心 RCM 计算函数 (遵循你的原版代码 + beta 修正)
+# 2. 核心 RCM 计算函数
 # ==========================================
 def mapstd(data):
     mean_val = np.mean(data, axis=1, keepdims=True)
@@ -55,7 +54,8 @@ def mapstd(data):
     std_val[std_val == 0] = 1.0
     return (data - mean_val) / std_val
 
-def RCM_index(target_data, input_data, dim=1, scale=6.0):
+# 【关键修正】：scale 改回论文原文设定的 5.0
+def RCM_index(target_data, input_data, dim=1, scale=5.0): 
     length = len(target_data)
     data = np.vstack((target_data, input_data))
     Data = mapstd(data)
@@ -107,7 +107,6 @@ def RCM_index(target_data, input_data, dim=1, scale=6.0):
     rtrain = rtotal_est[:, initialen:]
     traindata = Data1[:, initialen:]
 
-    # 【关键修正】：Figure 3 明确要求 beta = 1e-8
     beta = 1e-8 
     A = rtrain @ rtrain.T + beta * np.eye(resSize2)
     B = rtrain @ traindata.T
@@ -127,21 +126,20 @@ def RCM_index(target_data, input_data, dim=1, scale=6.0):
 # 3. 运行网络重构实验
 # ==========================================
 motifs = ['cascade', 'fan-out', 'fan-in']
-mus = [0.1, 0.4]  # 弱耦合与强耦合 [cite: 188]
-n_trials = 10     # 取 10 次的平均结果 [cite: 366]
-L_total = 5000    # 数据生成长度 [cite: 366]
+mus = [0.1, 0.4]  
+n_trials = 10     
+L_total = 6000  # 【修正】：总长度提升到6000，扣除丢弃的1000，保证送入5000  
 
 results = {m: {mu: np.zeros((3, 3)) for mu in mus} for m in motifs}
 
-print("开始多节点网络实验运算 (共6个组合，请稍候)...")
+print("开始纯净版 3D 网络实验运算 (共6个组合，请稍候)...")
 for motif in motifs:
     for mu in mus:
         print(f"  正在计算: Motif={motif}, mu={mu}")
         matrix_sum = np.zeros((3, 3))
         
         for trial in range(n_trials):
-            # Y 包含3个变量的时序，形状为 (3, 5000)
-            Y = generate_eq2(motif, mu, L_total)
+            Y = generate_eq2(motif, mu, L_total=L_total)
             
             for i in range(3):
                 for j in range(3):
@@ -150,7 +148,6 @@ for motif in motifs:
                         idx = RCM_index(target_data=Y[i], input_data=Y[j])
                         matrix_sum[i, j] += idx
                         
-        # 求平均值存入结果
         results[motif][mu] = matrix_sum / n_trials
 
 print("运算完成！开始绘制热力图矩阵...")
@@ -165,28 +162,20 @@ for r, motif in enumerate(motifs):
         ax = axes[r, c]
         matrix = results[motif][mu].copy()
         
-        # 将对角线置为空值 (对应原图的白色虚线格)
         np.fill_diagonal(matrix, np.nan)
-        
-        # 绘制热力图
         cax = ax.matshow(matrix, cmap='Blues', vmin=0, vmax=1)
         
-        # 填充数值文本
         for i in range(3):
             for j in range(3):
                 if i != j:
                     val = matrix[i, j]
-                    # 深色背景用白字，浅色背景用黑字
                     color = 'white' if val > 0.6 else 'black'
                     ax.text(j, i, f"{val:.2f}", va='center', ha='center', color=color, fontweight='bold')
                     
-        # 设置轴标签
         ax.set_xticks(range(3))
         ax.set_yticks(range(3))
         ax.set_xticklabels(['Y1', 'Y2', 'Y3'])
         ax.set_yticklabels(['Y1', 'Y2', 'Y3'])
-        
-        # 隐藏四周刻度短线
         ax.tick_params(left=False, top=False, bottom=False)
         
         if r == 0:
@@ -194,7 +183,6 @@ for r, motif in enumerate(motifs):
         if c == 0:
             ax.set_ylabel(motif.capitalize(), fontsize=16, fontweight='bold', labelpad=15)
 
-# 添加全局 Colorbar
 fig.subplots_adjust(right=0.85)
 cbar_ax = fig.add_axes([0.9, 0.15, 0.03, 0.7])
 fig.colorbar(cax, cax=cbar_ax)
