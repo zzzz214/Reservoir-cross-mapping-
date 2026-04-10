@@ -1,0 +1,202 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. 数据生成函数 (Equation 2: 三维逻辑斯蒂网络)
+# ==========================================
+def generate_eq2(motif, mu, L_total=5000):
+    """
+    生成文中 Equation 2 的三维离散逻辑斯蒂网络数据 [cite: 185, 186]。
+    使用边界反射机制维持混沌特性。
+    """
+    # 自身的增长率参数 [cite: 187]
+    gamma = np.array([3.6, 3.72, 3.68])
+    
+    Y = np.zeros((3, L_total))
+    Y[:, 0] = np.random.uniform(0.1, 0.9, 3)
+    
+    # 耦合矩阵 C, C[i, j] 表示从 i 指向 j 的因果作用 (\gamma_{ij})
+    C = np.zeros((3, 3))
+    if motif == 'cascade':      # 级联: Y1 -> Y3 -> Y2 [cite: 189]
+        C[0, 2] = mu  
+        C[2, 1] = mu  
+    elif motif == 'fan-out':    # 扇出: Y1 -> Y2, Y1 -> Y3 [cite: 189]
+        C[0, 1] = mu  
+        C[0, 2] = mu  
+    elif motif == 'fan-in':     # 扇入: Y1 -> Y2, Y3 -> Y2 [cite: 189]
+        C[0, 1] = mu  
+        C[2, 1] = mu  
+
+    for t in range(L_total - 1):
+        # 0.005 标准差的高斯白噪声 [cite: 187]
+        noise = np.random.normal(0, 0.005, 3)
+        for j in range(3):
+            # 计算流入 j 的其他节点的耦合总和
+            sum_coupling = sum(C[i, j] * Y[i, t] for i in range(3) if i != j)
+            # 为了保证系统在 [0,1] 域内稳定，提取出有效的自耦合调整项
+            sum_c_ij = sum(C[i, j] for i in range(3) if i != j)
+            
+            # Equation 2 的物理守恒形式 [cite: 186]
+            next_y = Y[j, t] * (gamma[j] - (gamma[j] - sum_c_ij)*Y[j, t] - sum_coupling) + noise[j]
+            
+            # 物理边界反射机制
+            ny = abs(next_y)
+            Y[j, t+1] = ny if ny <= 1.0 else 2.0 - ny
+            Y[j, t+1] = max(0.0001, min(0.9999, Y[j, t+1]))
+            
+    return Y
+
+# ==========================================
+# 2. 核心 RCM 计算函数 (遵循你的原版代码 + beta 修正)
+# ==========================================
+def mapstd(data):
+    mean_val = np.mean(data, axis=1, keepdims=True)
+    std_val = np.std(data, axis=1, ddof=1, keepdims=True)
+    std_val[std_val == 0] = 1.0
+    return (data - mean_val) / std_val
+
+def RCM_index(target_data, input_data, dim=1, scale=6.0):
+    length = len(target_data)
+    data = np.vstack((target_data, input_data))
+    Data = mapstd(data)
+
+    resSize1 = 200
+    gamma1 = 1.0 
+    
+    Win1 = np.random.uniform(-1, 1, (resSize1, dim))
+    Wres1 = np.random.uniform(-1, 1, (resSize1, resSize1))
+    rho1 = np.max(np.abs(np.linalg.eigvals(Wres1)))
+    Wres1 = Wres1 * (0.67 / rho1) 
+    
+    r1, r2 = np.zeros((resSize1, 1)), np.zeros((resSize1, 1))
+    rtotal1, rtotal2 = np.zeros((resSize1, length)), np.zeros((resSize1, length))
+
+    for i in range(length):
+        ut1 = Data[0:dim, i].reshape(-1, 1)
+        r1 = (1 - gamma1) * r1 + gamma1 * np.tanh(Win1 @ ut1 + Wres1 @ r1)
+        rtotal1[:, i:(i+1)] = r1
+        
+        ut2 = Data[dim:2*dim, i].reshape(-1, 1)
+        r2 = (1 - gamma1) * r2 + gamma1 * np.tanh(Win1 @ ut2 + Wres1 @ r2)
+        rtotal2[:, i:(i+1)] = r2
+
+    rtotal1[1::2, :] = rtotal1[1::2, :] ** 2
+    rtotal2[1::2, :] = rtotal2[1::2, :] ** 2
+
+    Data1, Data2 = mapstd(rtotal1), mapstd(rtotal2)
+
+    resSize2 = 1000
+    gamma2 = 1.0 
+    
+    Win2 = np.random.uniform(-1, 1, (resSize2, resSize1))
+    Wres2 = np.random.uniform(-1, 1, (resSize2, resSize2))
+    rho2 = np.max(np.abs(np.linalg.eigvals(Wres2)))
+    Wres2 = Wres2 * (0.9 / rho2) 
+    
+    r_est = np.zeros((resSize2, 1))
+    rtotal_est = np.zeros((resSize2, length))
+
+    for i in range(length):
+        ut = Data2[:, i].reshape(-1, 1)
+        r_est = (1 - gamma2) * r_est + gamma2 * np.tanh(Win2 @ ut + Wres2 @ r_est)
+        rtotal_est[:, i:(i+1)] = r_est
+
+    rtotal_est[1::2, :] = rtotal_est[1::2, :] ** 2
+
+    initialen = 1000 
+    rtrain = rtotal_est[:, initialen:]
+    traindata = Data1[:, initialen:]
+
+    # 【关键修正】：Figure 3 明确要求 beta = 1e-8
+    beta = 1e-8 
+    A = rtrain @ rtrain.T + beta * np.eye(resSize2)
+    B = rtrain @ traindata.T
+    Wout = np.linalg.solve(A, B).T
+    
+    trainoutput = Wout @ rtrain
+    
+    Mse1 = np.mean((trainoutput - traindata) ** 2)
+    dataset_mean = np.mean(traindata)
+    dataset_variance = np.mean((traindata - dataset_mean) ** 2)
+    
+    NMSE = Mse1 / dataset_variance
+    INDEX = np.exp(-scale * NMSE) 
+    return INDEX
+
+# ==========================================
+# 3. 运行网络重构实验
+# ==========================================
+motifs = ['cascade', 'fan-out', 'fan-in']
+mus = [0.1, 0.4]  # 弱耦合与强耦合 [cite: 188]
+n_trials = 10     # 取 10 次的平均结果 [cite: 366]
+L_total = 5000    # 数据生成长度 [cite: 366]
+
+results = {m: {mu: np.zeros((3, 3)) for mu in mus} for m in motifs}
+
+print("开始多节点网络实验运算 (共6个组合，请稍候)...")
+for motif in motifs:
+    for mu in mus:
+        print(f"  正在计算: Motif={motif}, mu={mu}")
+        matrix_sum = np.zeros((3, 3))
+        
+        for trial in range(n_trials):
+            # Y 包含3个变量的时序，形状为 (3, 5000)
+            Y = generate_eq2(motif, mu, L_total)
+            
+            for i in range(3):
+                for j in range(3):
+                    if i != j:
+                        # 计算 Yi 对 Yj 的因果影响：靶向为Yi，输入为Yj
+                        idx = RCM_index(target_data=Y[i], input_data=Y[j])
+                        matrix_sum[i, j] += idx
+                        
+        # 求平均值存入结果
+        results[motif][mu] = matrix_sum / n_trials
+
+print("运算完成！开始绘制热力图矩阵...")
+
+# ==========================================
+# 4. 可视化 (严格对齐 Figure 3)
+# ==========================================
+fig, axes = plt.subplots(3, 2, figsize=(8, 10))
+
+for r, motif in enumerate(motifs):
+    for c, mu in enumerate(mus):
+        ax = axes[r, c]
+        matrix = results[motif][mu].copy()
+        
+        # 将对角线置为空值 (对应原图的白色虚线格)
+        np.fill_diagonal(matrix, np.nan)
+        
+        # 绘制热力图
+        cax = ax.matshow(matrix, cmap='Blues', vmin=0, vmax=1)
+        
+        # 填充数值文本
+        for i in range(3):
+            for j in range(3):
+                if i != j:
+                    val = matrix[i, j]
+                    # 深色背景用白字，浅色背景用黑字
+                    color = 'white' if val > 0.6 else 'black'
+                    ax.text(j, i, f"{val:.2f}", va='center', ha='center', color=color, fontweight='bold')
+                    
+        # 设置轴标签
+        ax.set_xticks(range(3))
+        ax.set_yticks(range(3))
+        ax.set_xticklabels(['Y1', 'Y2', 'Y3'])
+        ax.set_yticklabels(['Y1', 'Y2', 'Y3'])
+        
+        # 隐藏四周刻度短线
+        ax.tick_params(left=False, top=False, bottom=False)
+        
+        if r == 0:
+            ax.set_title(rf'RCM ($\mu$={mu})', pad=15, fontsize=14)
+        if c == 0:
+            ax.set_ylabel(motif.capitalize(), fontsize=16, fontweight='bold', labelpad=15)
+
+# 添加全局 Colorbar
+fig.subplots_adjust(right=0.85)
+cbar_ax = fig.add_axes([0.9, 0.15, 0.03, 0.7])
+fig.colorbar(cax, cax=cbar_ax)
+
+plt.show()
